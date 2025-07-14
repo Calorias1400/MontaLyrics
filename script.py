@@ -70,8 +70,8 @@ def generar_timeline(bloques):
             cnt += 1
     return timeline
 
-# ——— Exportar EDL con gap inicial ———
-def exportar_edl(tl, imgs_dir, output, fps):
+# ——— Exportar XML para Premiere Pro ———
+def exportar_xml(tl, imgs_dir, output, fps):
     img_folder = Path(imgs_dir)
     def sort_key(p):
         m = re.search(r"(\d+)(?=\.png$)", p.name)
@@ -80,35 +80,169 @@ def exportar_edl(tl, imgs_dir, output, fps):
     if len(pngs) < len(tl):
         raise ValueError(f"Encontré {len(pngs)} PNGs, pero necesito {len(tl)}.")
 
-    def s_to_tc(sec):
-        frames = round(sec * fps)
-        hh     = frames // (fps*3600)
-        mm     = (frames % (fps*3600)) // (fps*60)
-        ss     = (frames % (fps*60))   // fps
-        ff     = frames % fps
-        return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+    def s_to_frames(sec):
+        return int(round(sec * fps))
+    
+    # Crear estructura XML para Final Cut Pro XML v1.2 (compatible con Premiere)
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="1">
+<project>
+<name>Auto Premiere Sequence</name>
+<children>
+<sequence id="autoseq">
+<name>Auto Sequence</name>
+<duration>{s_to_frames(max(clip['offset_s'] + clip['dur_s'] for clip in tl) if tl else 0)}</duration>
+<rate>
+<timebase>{fps}</timebase>
+<ntsc>FALSE</ntsc>
+</rate>
+<timecode>
+<rate>
+<timebase>{fps}</timebase>
+<ntsc>FALSE</ntsc>
+</rate>
+<string>00:00:00:00</string>
+<frame>0</frame>
+<source>source</source>
+<displayformat>NDF</displayformat>
+</timecode>
+<media>
+<video>"""
 
-    lines = ["TITLE:  AUTOSEQ", "FCM: NON-DROP FRAME\n"]
-    # GAP inicial: dura hasta el primer offset
-    if tl:
-        first_offset = tl[0]['offset_s']
-        gap_in     = '00:00:00:00'
-        gap_out    = s_to_tc(first_offset)
-        lines.append(f"001  BL  V  C   {gap_in} {gap_out} {gap_in} {gap_out}")
-        lines.append("")
-    # Eventos de imágenes
-    for idx, clip in enumerate(tl, start=2 if tl else 1):
-        src     = pngs[idx-2]  # desplazado 1 si hubo gap
-        in_tc   = '00:00:00:00'
-        out_tc  = s_to_tc(clip['dur_s'])
-        rec_in  = s_to_tc(clip['offset_s'])
-        rec_out = s_to_tc(clip['offset_s'] + clip['dur_s'])
-        reel    = src.name
-        lines.append(f"{idx:03d}  {reel}  V  C   {in_tc} {out_tc} {rec_in} {rec_out}")
-        lines.append(f"* SOURCE FILE: {src.resolve()}")
-        lines.append("")
+    # Agrupar clips por bloques (basado en proximidad temporal)
+    if not tl:
+        xml_content += """
+</video>
+</media>
+</sequence>
+</children>
+</project>
+</xmeml>"""
+        Path(output).write_text(xml_content, encoding="utf-8")
+        return
 
-    Path(output).write_text("\n".join(lines), encoding="utf-8")
+    # Detectar bloques analizando gaps en el timeline
+    bloques = []
+    bloque_actual = []
+    
+    for i, clip in enumerate(tl):
+        if i == 0:
+            bloque_actual = [clip]
+        else:
+            # Si hay un gap grande (>1 segundo) entre clips, es un nuevo bloque
+            gap = clip['offset_s'] - (tl[i-1]['offset_s'] + tl[i-1]['dur_s'])
+            if gap > 1.0:  # Nuevo bloque
+                bloques.append(bloque_actual)
+                bloque_actual = [clip]
+            else:
+                bloque_actual.append(clip)
+    
+    if bloque_actual:
+        bloques.append(bloque_actual)
+
+    # Determinar cuántas pistas necesitamos (el bloque más grande)
+    max_pistas = max(len(bloque) for bloque in bloques) if bloques else 1
+    
+    # Crear pistas de video
+    for track_num in range(1, max_pistas + 1):
+        xml_content += f"""
+<track>
+<clipitem id="clipitem-{track_num}">
+<name>V{track_num}</name>
+<enabled>TRUE</enabled>
+<locked>FALSE</locked>
+</clipitem>
+</track>"""
+    
+    xml_content += """
+</video>
+</media>
+</sequence>
+</children>
+</project>
+<bin>"""
+
+    # Agregar clips a las pistas correspondientes
+    clip_id = 1
+    png_index = 0
+    
+    for bloque in bloques:
+        for track_idx, clip in enumerate(bloque):
+            if png_index >= len(pngs):
+                break
+                
+            src_file = pngs[png_index]
+            track_num = track_idx + 1  # V1, V2, V3...
+            
+            start_frame = s_to_frames(clip['offset_s'])
+            end_frame = s_to_frames(clip['offset_s'] + clip['dur_s'])
+            duration_frames = s_to_frames(clip['dur_s'])
+            
+            # Agregar clip al bin
+            xml_content += f"""
+<children>
+<clip id="clip-{clip_id}">
+<name>{src_file.name}</name>
+<duration>{duration_frames}</duration>
+<rate>
+<timebase>{fps}</timebase>
+<ntsc>FALSE</ntsc>
+</rate>
+<media>
+<video>
+<track>
+<clipitem id="clipitem-{clip_id}">
+<name>{src_file.name}</name>
+<enabled>TRUE</enabled>
+<duration>{duration_frames}</duration>
+<start>{start_frame}</start>
+<end>{end_frame}</end>
+<in>0</in>
+<out>{duration_frames}</out>
+<file id="file-{clip_id}">
+<name>{src_file.name}</name>
+<pathurl>file://localhost{src_file.resolve()}</pathurl>
+<rate>
+<timebase>{fps}</timebase>
+<ntsc>FALSE</ntsc>
+</rate>
+<duration>{duration_frames}</duration>
+<media>
+<video>
+<samplecharacteristics>
+<rate>
+<timebase>{fps}</timebase>
+<ntsc>FALSE</ntsc>
+</rate>
+<width>1920</width>
+<height>1080</height>
+<anamorphic>FALSE</anamorphic>
+<pixelaspectratio>square</pixelaspectratio>
+<fielddominance>none</fielddominance>
+</samplecharacteristics>
+</video>
+</media>
+</file>
+<sourcetrack>
+<mediatype>video</mediatype>
+<trackindex>1</trackindex>
+</sourcetrack>
+</clipitem>
+</track>
+</video>
+</media>
+</clip>
+</children>"""
+            
+            clip_id += 1
+            png_index += 1
+
+    xml_content += """
+</bin>
+</xmeml>"""
+
+    Path(output).write_text(xml_content, encoding="utf-8")
 
 # ——— GUI ———
 class App:
@@ -120,14 +254,14 @@ class App:
         Button(root, text=".srt",             command=self.sel_srt).grid(row=1, column=0, columnspan=2, sticky="ew")
         Button(root, text="XML markers",      command=self.sel_xml).grid(row=2, column=0, columnspan=2, sticky="ew")
         Button(root, text="Carpeta imágenes", command=self.sel_imgs).grid(row=3, column=0, columnspan=2, sticky="ew")
-        Button(root, text="Destino EDL",      command=self.sel_dest).grid(row=4, column=0, columnspan=2, sticky="ew")
-        Button(root, text="Generar EDL",      command=self.run).grid(row=5, column=0, columnspan=2, sticky="ew")
+        Button(root, text="Destino XML",      command=self.sel_dest).grid(row=4, column=0, columnspan=2, sticky="ew")
+        Button(root, text="Generar XML",      command=self.run).grid(row=5, column=0, columnspan=2, sticky="ew")
         self.paths = {'srt': None, 'xml': None, 'imgs': None, 'dest': None}
 
     def sel_srt(self):  self.paths['srt']  = filedialog.askopenfilename(filetypes=[('SRT','*.srt')])
     def sel_xml(self):  self.paths['xml']  = filedialog.askopenfilename(filetypes=[('XML','*.xml')])
     def sel_imgs(self): self.paths['imgs'] = filedialog.askdirectory()
-    def sel_dest(self): self.paths['dest'] = filedialog.asksaveasfilename(defaultextension='.edl', filetypes=[('EDL','*.edl')])
+    def sel_dest(self): self.paths['dest'] = filedialog.asksaveasfilename(defaultextension='.xml', filetypes=[('XML','*.xml')])
 
     def run(self):
         try:
@@ -136,8 +270,8 @@ class App:
             markers = leer_markers(self.paths['xml'], fps)
             bloques = generar_bloques_por_pares(markers, subs)
             tl      = generar_timeline(bloques)
-            out     = self.paths.get('dest') or 'secuencia.edl'
-            exportar_edl(tl, self.paths['imgs'], out, fps)
+            out     = self.paths.get('dest') or 'secuencia.xml'
+            exportar_xml(tl, self.paths['imgs'], out, fps)
             messagebox.showinfo('¡Listo!','Importa "{}" en Premiere (Archivo > Importar…)'.format(out))
         except Exception as e:
             messagebox.showerror('Error', str(e))
